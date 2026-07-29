@@ -71,6 +71,112 @@ class GpuAllocationStatus:
         return asdict(self)
 
 
+GPU_HEALTH_CHECK_NAMESPACE = "gpu-health-check"
+GPU_HEALTH_CHECK_IMAGE = "nvcr.io/nvidia/cuda:12.6.3-base-ubi9"
+
+GPU_DIAGNOSTIC_SCRIPT = r"""
+set -e
+
+OUTPUT=$(nvidia-smi --query-gpu=index,name,uuid,temperature.gpu,temperature.memory,power.draw,power.limit,utilization.gpu,utilization.memory,memory.used,memory.total,memory.free,ecc.errors.corrected.aggregate.total,ecc.errors.uncorrected.aggregate.total,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max --format=csv,noheader,nounits 2>&1)
+
+DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+CUDA_VERSION=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 || echo "N/A")
+
+XID_ERRORS=0
+if command -v dmesg &>/dev/null; then
+  XID_ERRORS=$(dmesg 2>/dev/null | grep -c "NVRM: Xid" || echo "0")
+fi
+
+NVLINK_STATUS="unknown"
+nvidia-smi nvlink --status &>/dev/null && NVLINK_STATUS="available" || NVLINK_STATUS="not_available"
+
+python3 -c "
+import csv, json, sys, io
+
+raw = '''$OUTPUT'''
+driver = '$DRIVER_VERSION'
+cuda = '$CUDA_VERSION'
+xid = int('$XID_ERRORS')
+nvlink = '$NVLINK_STATUS'
+
+gpus = []
+reader = csv.reader(io.StringIO(raw.strip()))
+for row in reader:
+    if len(row) < 18:
+        continue
+    row = [c.strip() for c in row]
+    def to_float(v):
+        try: return float(v)
+        except: return 0.0
+    def to_int(v):
+        try: return int(v)
+        except: return 0
+
+    gpu = {
+        'index': to_int(row[0]),
+        'name': row[1],
+        'uuid': row[2],
+        'temperature_gpu': to_float(row[3]),
+        'temperature_memory': to_float(row[4]) if row[4] != '[N/A]' else None,
+        'power_draw': to_float(row[5]),
+        'power_limit': to_float(row[6]),
+        'utilization_gpu': to_float(row[7]),
+        'utilization_memory': to_float(row[8]),
+        'memory_used': to_float(row[9]),
+        'memory_total': to_float(row[10]),
+        'memory_free': to_float(row[11]),
+        'ecc_errors_corrected': to_int(row[12]) if row[12] != '[N/A]' else 0,
+        'ecc_errors_uncorrected': to_int(row[13]) if row[13] != '[N/A]' else 0,
+        'xid_errors': xid,
+        'pcie_link_gen_current': to_int(row[14]),
+        'pcie_link_gen_max': to_int(row[15]),
+        'pcie_link_width_current': to_int(row[16]),
+        'pcie_link_width_max': to_int(row[17]),
+        'nvlink_active': nvlink == 'available',
+    }
+
+    issues = []
+    status = 'healthy'
+    if gpu['temperature_gpu'] >= 90:
+        issues.append('GPU temperature critical (>=90C)')
+        status = 'error'
+    elif gpu['temperature_gpu'] >= 80:
+        issues.append('GPU temperature high (>=80C)')
+        if status != 'error': status = 'warning'
+    if gpu['ecc_errors_uncorrected'] > 0:
+        issues.append(f\"Uncorrected ECC errors: {gpu['ecc_errors_uncorrected']}\")
+        status = 'error'
+    if gpu['ecc_errors_corrected'] > 10:
+        issues.append(f\"High corrected ECC errors: {gpu['ecc_errors_corrected']}\")
+        if status != 'error': status = 'warning'
+    if gpu['xid_errors'] > 0:
+        issues.append(f'XID errors detected: {gpu[\"xid_errors\"]}')
+        status = 'error'
+    if gpu['pcie_link_gen_current'] < gpu['pcie_link_gen_max'] and gpu['pcie_link_gen_max'] > 0:
+        issues.append(f\"PCIe downgraded: Gen{gpu['pcie_link_gen_current']} (max Gen{gpu['pcie_link_gen_max']})\")
+        if status != 'error': status = 'warning'
+    if gpu['pcie_link_width_current'] < gpu['pcie_link_width_max'] and gpu['pcie_link_width_max'] > 0:
+        issues.append(f\"PCIe width reduced: x{gpu['pcie_link_width_current']} (max x{gpu['pcie_link_width_max']})\")
+        if status != 'error': status = 'warning'
+    if gpu['power_draw'] > gpu['power_limit'] * 0.95 and gpu['power_limit'] > 0:
+        issues.append('Power draw near limit')
+        if status != 'error': status = 'warning'
+
+    gpu['health_status'] = status
+    gpu['health_issues'] = issues
+    gpus.append(gpu)
+
+result = {
+    'driver_version': driver,
+    'cuda_version': cuda,
+    'gpus': gpus,
+    'node_status': 'error' if any(g['health_status'] == 'error' for g in gpus) else ('warning' if any(g['health_status'] == 'warning' for g in gpus) else 'healthy')
+}
+print(json.dumps(result))
+"
+"""
+
+
 class KubernetesService:
     def __init__(self, kubeconfig_path: str):
         self.kubeconfig_path = kubeconfig_path
@@ -78,6 +184,7 @@ class KubernetesService:
         self._core_v1 = None
         self._version_api = None
         self._custom_objects = None
+        self._batch_v1 = None
         self._configuration = None
 
     def _load_config(self):
@@ -136,6 +243,136 @@ class KubernetesService:
             self._load_config()
             self._custom_objects = client.CustomObjectsApi(self._api_client)
         return self._custom_objects
+
+    @property
+    def batch_v1(self):
+        if self._batch_v1 is None:
+            if self._api_client is None:
+                self._load_config()
+            self._batch_v1 = client.BatchV1Api(self._api_client)
+        return self._batch_v1
+
+    # ── GPU Health Check ─────────────────────────────────────────────────
+
+    def get_gpu_node_names(self) -> List[Dict[str, Any]]:
+        """List nodes that have nvidia.com/gpu capacity > 0."""
+        nodes = self.core_v1.list_node(_request_timeout=K8S_API_TIMEOUT)
+        gpu_nodes = []
+        for node in nodes.items:
+            labels = node.metadata.labels or {}
+            capacity = int(node.status.capacity.get("nvidia.com/gpu", 0))
+            if capacity > 0:
+                gpu_nodes.append({
+                    "name": node.metadata.name,
+                    "gpu_count": capacity,
+                    "gpu_product": labels.get("nvidia.com/gpu.product", "Unknown GPU"),
+                })
+        return gpu_nodes
+
+    def ensure_namespace(self, name: str) -> None:
+        """Create namespace if it does not exist."""
+        try:
+            self.core_v1.create_namespace(
+                body=client.V1Namespace(
+                    metadata=client.V1ObjectMeta(name=name)
+                )
+            )
+            logger.info(f"Created namespace {name}")
+        except ApiException as e:
+            if e.status != 409:
+                raise
+
+    def create_gpu_health_check_job(
+        self, node_name: str, namespace: str, job_name: str
+    ) -> str:
+        """Create a K8s Job that runs GPU diagnostics on a specific node."""
+        job = client.V1Job(
+            api_version="batch/v1",
+            kind="Job",
+            metadata=client.V1ObjectMeta(
+                name=job_name,
+                namespace=namespace,
+                labels={"app": "gpu-health-check"},
+            ),
+            spec=client.V1JobSpec(
+                ttl_seconds_after_finished=300,
+                active_deadline_seconds=120,
+                backoff_limit=0,
+                template=client.V1PodTemplateSpec(
+                    spec=client.V1PodSpec(
+                        restart_policy="Never",
+                        node_selector={"kubernetes.io/hostname": node_name},
+                        containers=[
+                            client.V1Container(
+                                name="gpu-diag",
+                                image=GPU_HEALTH_CHECK_IMAGE,
+                                command=["/bin/bash", "-c", GPU_DIAGNOSTIC_SCRIPT],
+                                resources=client.V1ResourceRequirements(
+                                    limits={"nvidia.com/gpu": "1"},
+                                    requests={"nvidia.com/gpu": "1"},
+                                ),
+                            )
+                        ],
+                        tolerations=[
+                            client.V1Toleration(
+                                key="nvidia.com/gpu",
+                                operator="Exists",
+                                effect="NoSchedule",
+                            )
+                        ],
+                    )
+                ),
+            ),
+        )
+        self.batch_v1.create_namespaced_job(namespace=namespace, body=job)
+        logger.info(f"Created GPU health check job {job_name} on node {node_name}")
+        return job_name
+
+    def get_job_status(self, namespace: str, job_name: str) -> Dict[str, Any]:
+        """Return job phase and pod name."""
+        job = self.batch_v1.read_namespaced_job_status(
+            name=job_name, namespace=namespace
+        )
+        phase = "Pending"
+        if job.status.active:
+            phase = "Running"
+        elif job.status.succeeded:
+            phase = "Succeeded"
+        elif job.status.failed:
+            phase = "Failed"
+
+        pod_name = None
+        try:
+            pods = self.core_v1.list_namespaced_pod(
+                namespace=namespace,
+                label_selector=f"job-name={job_name}",
+            )
+            if pods.items:
+                pod_name = pods.items[0].metadata.name
+        except Exception:
+            pass
+
+        return {"phase": phase, "pod_name": pod_name}
+
+    def get_pod_logs(self, namespace: str, pod_name: str) -> str:
+        """Read pod logs."""
+        return self.core_v1.read_namespaced_pod_log(
+            name=pod_name, namespace=namespace
+        )
+
+    def delete_job(self, namespace: str, job_name: str) -> bool:
+        """Delete a Job and its pods."""
+        try:
+            self.batch_v1.delete_namespaced_job(
+                name=job_name,
+                namespace=namespace,
+                body=client.V1DeleteOptions(propagation_policy="Foreground"),
+            )
+            return True
+        except ApiException as e:
+            if e.status == 404:
+                return False
+            raise
 
     def get_cluster_info(self) -> Dict[str, Any]:
         try:

@@ -330,3 +330,67 @@ export interface HearthConnectResponse {
   success: boolean
   message: string
 }
+
+// GPU Health Check types
+
+export interface GpuDeviceHealth {
+  index: number
+  name: string
+  uuid: string
+  temperature_gpu: number
+  temperature_memory: number | null
+  power_draw: number
+  power_limit: number
+  utilization_gpu: number
+  utilization_memory: number
+  memory_used: number
+  memory_total: number
+  memory_free: number
+  ecc_errors_corrected: number
+  ecc_errors_uncorrected: number
+  xid_errors: number
+  pcie_link_gen_current: number
+  pcie_link_gen_max: number
+  pcie_link_width_current: number
+  pcie_link_width_max: number
+  nvlink_active: boolean
+  health_status: 'healthy' | 'warning' | 'error'
+  health_issues: string[]
+}
+
+export interface GpuNodeHealthResult {
+  node_name: string
+  status: 'healthy' | 'warning' | 'error' | 'skipped'
+  gpus: GpuDeviceHealth[]
+  driver_version: string | null
+  cuda_version: string | null
+  error: string | null
+}
+
+export interface GpuHealthSummary {
+  total_gpus_checked: number
+  healthy: number
+  warnings: number
+  errors: number
+  nodes_checked: number
+  nodes_skipped: number
+}
+
+export interface GpuHealthCheckResults {
+  cluster_id: string
+  checked_at: string
+  nodes: GpuNodeHealthResult[]
+  summary: GpuHealthSummary
+}
+
+export interface GpuHealthCheckStatus {
+  task_id?: string
+  status: 'idle' | 'starting' | 'creating_jobs' | 'waiting' | 'collecting' | 'cleaning_up' | 'completed' | 'failed'
+  message?: string
+  started_at?: string
+  completed_at?: string
+  total_nodes: number
+  completed_nodes: number
+  results?: GpuHealthCheckResults
+  error?: string
+}

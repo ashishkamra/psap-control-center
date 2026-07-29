@@ -34,6 +34,9 @@ cost_refresh_state = {
     "last_cluster": None,
 }
 
+# key = cluster_id -> task state dict
+gpu_health_check_tasks: dict = {}
+
 
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler to prevent raw exception details from leaking to clients."""

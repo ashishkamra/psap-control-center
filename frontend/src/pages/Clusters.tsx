@@ -13,6 +13,7 @@ import {
   CheckCircleIcon,
   ExclamationTriangleIcon,
   ClockIcon,
+  CpuChipIcon,
 } from '@heroicons/react/24/outline'
 import { useDropzone } from 'react-dropzone'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -23,6 +24,7 @@ import toast from 'react-hot-toast'
 import clsx from 'clsx'
 import type { GpuAllocationStatus, ClusterCost } from '../types'
 import GpuDonutChart from '../components/GpuDonutChart'
+import GpuHealthCheckModal from '../components/GpuHealthCheckModal'
 import { isAdmin } from '../stores/authStore'
 
 function timeAgo(dateStr: string): string {
@@ -62,6 +64,7 @@ export default function Clusters() {
   const [refreshing, setRefreshing] = useState(false)
   const [refreshProgress, setRefreshProgress] = useState<RefreshProgress | null>(null)
   const [countdown, setCountdown] = useState('')
+  const [healthCheckCluster, setHealthCheckCluster] = useState<{ id: string; name: string } | null>(null)
   const prevLastRefresh = useRef<string | null>(null)
 
   const queryClient = useQueryClient()
@@ -587,16 +590,27 @@ export default function Clusters() {
                   <EyeIcon className="h-4 w-4" />
                   View Details
                 </Link>
-                {isAdmin() && (
-                  <button
-                    onClick={() => handleRemove(cluster.id, cluster.name)}
-                    disabled={deleteCluster.isPending}
-                    className="text-sm font-medium text-orange-600 hover:text-orange-700 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <TrashIcon className="h-4 w-4" />
-                    {deleteCluster.isPending ? 'Removing...' : 'Remove'}
-                  </button>
-                )}
+                <div className="flex items-center gap-3">
+                  {isAdmin() && cluster.gpu_count && parseInt(cluster.gpu_count) > 0 && (
+                    <button
+                      onClick={() => setHealthCheckCluster({ id: cluster.id, name: cluster.name })}
+                      className="text-sm font-medium text-primary-600 hover:text-primary-700 flex items-center gap-1"
+                    >
+                      <CpuChipIcon className="h-4 w-4" />
+                      GPU Health Check
+                    </button>
+                  )}
+                  {isAdmin() && (
+                    <button
+                      onClick={() => handleRemove(cluster.id, cluster.name)}
+                      disabled={deleteCluster.isPending}
+                      className="text-sm font-medium text-orange-600 hover:text-orange-700 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <TrashIcon className="h-4 w-4" />
+                      {deleteCluster.isPending ? 'Removing...' : 'Remove'}
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           ))}
@@ -820,6 +834,15 @@ export default function Clusters() {
           </div>
         </Dialog>
       </Transition>
+
+      {healthCheckCluster && (
+        <GpuHealthCheckModal
+          open={!!healthCheckCluster}
+          onClose={() => setHealthCheckCluster(null)}
+          clusterId={healthCheckCluster.id}
+          clusterName={healthCheckCluster.name}
+        />
+      )}
     </div>
   )
 }

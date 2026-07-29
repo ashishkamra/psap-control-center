@@ -19,6 +19,7 @@ import type {
   HearthConnectResponse,
   BillingReport,
   CostRefreshStatus,
+  GpuHealthCheckStatus,
 } from '../types'
 import { createLogger } from '../utils/logger'
 import { clearSession } from '../stores/authStore'
@@ -173,6 +174,16 @@ export const clusterApi = {
   refreshCost: async (id: string): Promise<ClusterCost[]> => {
     const { data } = await api.post(`/clusters/${id}/cost/refresh`)
     return data.costs
+  },
+
+  launchGpuHealthCheck: async (id: string): Promise<GpuHealthCheckStatus> => {
+    const { data } = await api.post(`/clusters/${id}/gpu-health-check`)
+    return data
+  },
+
+  getGpuHealthCheckStatus: async (id: string): Promise<GpuHealthCheckStatus> => {
+    const { data } = await api.get(`/clusters/${id}/gpu-health-check`)
+    return data
   },
 
   getRefreshSchedule: async (): Promise<{
