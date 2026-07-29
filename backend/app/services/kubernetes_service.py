@@ -255,64 +255,19 @@ class KubernetesService:
     # ── GPU Health Check ─────────────────────────────────────────────────
 
     def get_gpu_node_names(self) -> List[Dict[str, Any]]:
-        """List nodes that have GPUs, checking both legacy capacity and DRA ResourceSlices."""
+        """List nodes that have nvidia.com/gpu capacity > 0."""
         nodes = self.core_v1.list_node(_request_timeout=K8S_API_TIMEOUT)
-        gpu_nodes = {}
-
-        # Legacy: check nvidia.com/gpu in node capacity
+        gpu_nodes = []
         for node in nodes.items:
             labels = node.metadata.labels or {}
             capacity = int(node.status.capacity.get("nvidia.com/gpu", 0))
             if capacity > 0:
-                gpu_nodes[node.metadata.name] = {
+                gpu_nodes.append({
                     "name": node.metadata.name,
                     "gpu_count": capacity,
                     "gpu_product": labels.get("nvidia.com/gpu.product", "Unknown GPU"),
-                }
-
-        # DRA: check ResourceSlices for GPU drivers
-        if not gpu_nodes:
-            dra_version = self._detect_dra_version()
-            if dra_version:
-                try:
-                    slices = self.custom_objects.list_cluster_custom_object(
-                        group=DRA_API_GROUP, version=dra_version,
-                        plural="resourceslices",
-                        _request_timeout=K8S_API_TIMEOUT,
-                    )
-                    for rs in slices.get("items", []):
-                        driver = rs.get("spec", {}).get("driver", "")
-                        if driver not in DRA_GPU_DRIVER_NAMES:
-                            continue
-                        node_name = rs.get("spec", {}).get("nodeName") or rs.get("nodeName")
-                        if not node_name:
-                            continue
-                        devices = rs.get("spec", {}).get("devices", []) or []
-                        if not devices:
-                            continue
-
-                        product = "Unknown GPU"
-                        for device in devices:
-                            attrs = device.get("attributes", {})
-                            if not attrs:
-                                attrs = device.get("basic", {}).get("attributes", {})
-                            name = self._extract_dra_attribute(attrs, "productName")
-                            if name:
-                                product = name
-                                break
-
-                        if node_name in gpu_nodes:
-                            gpu_nodes[node_name]["gpu_count"] += len(devices)
-                        else:
-                            gpu_nodes[node_name] = {
-                                "name": node_name,
-                                "gpu_count": len(devices),
-                                "gpu_product": product,
-                            }
-                except Exception as e:
-                    logger.warning(f"DRA ResourceSlice query failed in get_gpu_node_names: {e}")
-
-        return list(gpu_nodes.values())
+                })
+        return gpu_nodes
 
     def ensure_namespace(self, name: str) -> None:
         """Create namespace if it does not exist."""
@@ -450,34 +405,6 @@ class KubernetesService:
                 }
                 node_details.append(node_info)
                 gpu_count += node_gpu
-
-            # If legacy detection found no GPUs, try DRA
-            if gpu_count == 0:
-                dra_version = self._detect_dra_version()
-                if dra_version:
-                    try:
-                        slices = self.custom_objects.list_cluster_custom_object(
-                            group=DRA_API_GROUP, version=dra_version,
-                            plural="resourceslices",
-                            _request_timeout=K8S_API_TIMEOUT,
-                        )
-                        for rs in slices.get("items", []):
-                            driver = rs.get("spec", {}).get("driver", "")
-                            if driver not in DRA_GPU_DRIVER_NAMES:
-                                continue
-                            devices = rs.get("spec", {}).get("devices", []) or []
-                            gpu_count += len(devices)
-
-                            for device in devices:
-                                attrs = device.get("attributes", {})
-                                if not attrs:
-                                    attrs = device.get("basic", {}).get("attributes", {})
-                                name = self._extract_dra_attribute(attrs, "productName")
-                                if name:
-                                    display_name = name
-                                    gpu_products[display_name] = gpu_products.get(display_name, 0) + 1
-                    except Exception as e:
-                        logger.warning(f"DRA GPU count in get_cluster_info failed: {e}")
 
             gpu_type = None
             if gpu_products:
