@@ -561,32 +561,62 @@ _health_check_executor = ThreadPoolExecutor(
 )
 
 
+def _set_step(task: dict, key: str, status: str, detail: str = None):
+    """Update a step's status and optional detail text in the task's steps list."""
+    for step in task.get("steps", []):
+        if step["key"] == key:
+            step["status"] = status
+            if detail is not None:
+                step["detail"] = detail
+            break
+
+
+def _update_node_job(task: dict, job_name: str, phase: str):
+    """Update the phase of a tracked node job."""
+    for nj in task.get("node_jobs", []):
+        if nj["job_name"] == job_name:
+            nj["phase"] = phase
+            break
+
+
 async def _run_gpu_health_check(cluster_id: str, task_id: str):
     """Background task: create diagnostic Jobs on GPU nodes, collect results."""
     from app.main import gpu_health_check_tasks
 
     task = gpu_health_check_tasks[cluster_id]
     loop = asyncio.get_event_loop()
+    job_map = {}
 
     try:
+        # Step 1: Connect to cluster
+        _set_step(task, "connect", "active", "Loading kubeconfig...")
         async with AsyncSessionLocal() as session:
             service = ClusterService(session)
             cluster = await service.get_cluster(cluster_id)
             if not cluster or not cluster.kubeconfig_path:
+                _set_step(task, "connect", "error", "Cluster not found or has no kubeconfig")
                 task["status"] = "failed"
                 task["error"] = "Cluster not found or has no kubeconfig"
                 return
 
             k8s = KubernetesService(cluster.kubeconfig_path)
 
+        _set_step(task, "connect", "done", "Connected to cluster")
+
+        # Step 2: Discover GPU nodes
         task["status"] = "creating_jobs"
-        task["message"] = "Discovering GPU nodes..."
+        _set_step(task, "discover", "active", "Querying nodes for nvidia.com/gpu capacity...")
 
         gpu_nodes = await loop.run_in_executor(
             _health_check_executor, k8s.get_gpu_node_names
         )
 
         if not gpu_nodes:
+            _set_step(task, "discover", "done", "No GPU nodes found on this cluster")
+            for step in task["steps"]:
+                if step["status"] == "pending":
+                    step["status"] = "done"
+                    step["detail"] = "Skipped — no GPU nodes"
             task["status"] = "completed"
             task["message"] = "No GPU nodes found"
             task["completed_at"] = datetime.now(timezone.utc).isoformat()
@@ -595,25 +625,32 @@ async def _run_gpu_health_check(cluster_id: str, task_id: str):
                 "checked_at": datetime.now(timezone.utc).isoformat(),
                 "nodes": [],
                 "summary": {
-                    "total_gpus_checked": 0,
-                    "healthy": 0,
-                    "warnings": 0,
-                    "errors": 0,
-                    "nodes_checked": 0,
-                    "nodes_skipped": 0,
+                    "total_gpus_checked": 0, "healthy": 0, "warnings": 0,
+                    "errors": 0, "nodes_checked": 0, "nodes_skipped": 0,
                 },
             }
             return
 
+        node_summary = ", ".join(
+            f"{n['name']} ({n['gpu_count']} GPUs)" for n in gpu_nodes
+        )
+        _set_step(
+            task, "discover", "done",
+            f"Found {len(gpu_nodes)} GPU node(s): {node_summary}",
+        )
         task["total_nodes"] = len(gpu_nodes)
-        task["message"] = f"Creating diagnostic jobs on {len(gpu_nodes)} GPU node(s)..."
+        task["message"] = f"Found {len(gpu_nodes)} GPU node(s)"
 
+        # Step 3: Ensure namespace
+        _set_step(task, "namespace", "active", f"Creating namespace '{GPU_HEALTH_CHECK_NAMESPACE}' if needed...")
         await loop.run_in_executor(
             _health_check_executor,
             lambda: k8s.ensure_namespace(GPU_HEALTH_CHECK_NAMESPACE),
         )
+        _set_step(task, "namespace", "done", f"Namespace '{GPU_HEALTH_CHECK_NAMESPACE}' ready")
 
-        job_map = {}
+        # Step 4: Create Jobs
+        _set_step(task, "create_jobs", "active", "Submitting diagnostic jobs...")
         for node in gpu_nodes:
             node_hash = node["name"].replace(".", "-")[:20]
             job_name = f"gpu-hc-{task_id[:8]}-{node_hash}"
@@ -625,14 +662,35 @@ async def _run_gpu_health_check(cluster_id: str, task_id: str):
                     ),
                 )
                 job_map[job_name] = node
+                task["node_jobs"].append({
+                    "node_name": node["name"],
+                    "job_name": job_name,
+                    "gpu_count": node["gpu_count"],
+                    "gpu_product": node.get("gpu_product", "Unknown GPU"),
+                    "phase": "Pending",
+                })
             except Exception as e:
                 logger.warning(f"Failed to create job for node {node['name']}: {e}")
+                task["node_jobs"].append({
+                    "node_name": node["name"],
+                    "job_name": job_name,
+                    "gpu_count": node["gpu_count"],
+                    "gpu_product": node.get("gpu_product", "Unknown GPU"),
+                    "phase": "Failed",
+                })
 
+        created_count = sum(1 for nj in task["node_jobs"] if nj["phase"] != "Failed")
+        _set_step(
+            task, "create_jobs", "done",
+            f"Created {created_count} job(s) across {len(gpu_nodes)} node(s)",
+        )
+
+        # Step 5: Wait for pods to run and complete
         task["status"] = "waiting"
-        task["message"] = "Waiting for diagnostic pods to complete..."
+        _set_step(task, "wait_pods", "active", "Pods scheduling and running nvidia-smi diagnostics...")
 
         node_results = []
-        pending_jobs = dict(job_map)
+        pending_jobs = {jn: n for jn, n in job_map.items()}
         elapsed = 0
         poll_interval = 3
 
@@ -652,57 +710,94 @@ async def _run_gpu_health_check(cluster_id: str, task_id: str):
                 except Exception:
                     continue
 
+                _update_node_job(task, job_name, status["phase"])
+
                 if status["phase"] in ("Succeeded", "Failed"):
                     done_jobs.append(job_name)
-                    result_entry = {
-                        "node_name": node["name"],
-                        "status": "error",
-                        "gpus": [],
-                        "driver_version": None,
-                        "cuda_version": None,
-                        "error": None,
-                    }
-
-                    if status["phase"] == "Succeeded" and status["pod_name"]:
-                        try:
-                            logs = await loop.run_in_executor(
-                                _health_check_executor,
-                                lambda pn=status["pod_name"]: k8s.get_pod_logs(
-                                    GPU_HEALTH_CHECK_NAMESPACE, pn
-                                ),
-                            )
-                            parsed = json.loads(logs.strip().split("\n")[-1])
-                            result_entry["status"] = parsed.get("node_status", "error")
-                            result_entry["gpus"] = parsed.get("gpus", [])
-                            result_entry["driver_version"] = parsed.get("driver_version")
-                            result_entry["cuda_version"] = parsed.get("cuda_version")
-                        except Exception as e:
-                            result_entry["error"] = f"Failed to parse results: {e}"
-                    else:
-                        result_entry["error"] = "Job failed or timed out"
-
-                    node_results.append(result_entry)
-                    task["completed_nodes"] += 1
-                    task["message"] = (
-                        f"Collected results from {task['completed_nodes']}/{task['total_nodes']} nodes"
-                    )
 
             for jn in done_jobs:
                 del pending_jobs[jn]
 
-        for job_name, node in pending_jobs.items():
-            node_results.append({
-                "node_name": node["name"],
-                "status": "skipped",
+            running = sum(1 for nj in task["node_jobs"] if nj["phase"] == "Running")
+            pending = sum(1 for nj in task["node_jobs"] if nj["phase"] == "Pending")
+            finished = sum(1 for nj in task["node_jobs"] if nj["phase"] in ("Succeeded", "Failed"))
+            _set_step(
+                task, "wait_pods", "active",
+                f"{finished} done, {running} running, {pending} pending ({elapsed}s elapsed)",
+            )
+
+        # Mark remaining as timed out
+        for job_name in pending_jobs:
+            _update_node_job(task, job_name, "Timeout")
+
+        all_done = sum(1 for nj in task["node_jobs"] if nj["phase"] in ("Succeeded", "Failed", "Timeout"))
+        _set_step(task, "wait_pods", "done", f"All {all_done} node(s) finished")
+
+        # Step 6: Collect results from pod logs
+        task["status"] = "collecting"
+        _set_step(task, "collect", "active", "Reading pod logs...")
+
+        for nj in task["node_jobs"]:
+            job_name = nj["job_name"]
+            node = job_map.get(job_name)
+            if not node:
+                continue
+
+            result_entry = {
+                "node_name": nj["node_name"],
+                "status": "error",
                 "gpus": [],
                 "driver_version": None,
                 "cuda_version": None,
-                "error": "Timed out waiting for pod to schedule (no free GPU?)",
-            })
+                "error": None,
+            }
 
+            if nj["phase"] == "Succeeded":
+                try:
+                    job_status = await loop.run_in_executor(
+                        _health_check_executor,
+                        lambda jn=job_name: k8s.get_job_status(
+                            GPU_HEALTH_CHECK_NAMESPACE, jn
+                        ),
+                    )
+                    pod_name = job_status.get("pod_name")
+                    if pod_name:
+                        logs = await loop.run_in_executor(
+                            _health_check_executor,
+                            lambda pn=pod_name: k8s.get_pod_logs(
+                                GPU_HEALTH_CHECK_NAMESPACE, pn
+                            ),
+                        )
+                        parsed = json.loads(logs.strip().split("\n")[-1])
+                        result_entry["status"] = parsed.get("node_status", "error")
+                        result_entry["gpus"] = parsed.get("gpus", [])
+                        result_entry["driver_version"] = parsed.get("driver_version")
+                        result_entry["cuda_version"] = parsed.get("cuda_version")
+                        _set_step(
+                            task, "collect", "active",
+                            f"Parsed results from {nj['node_name']}: {len(result_entry['gpus'])} GPU(s)",
+                        )
+                except Exception as e:
+                    result_entry["error"] = f"Failed to parse results: {e}"
+            elif nj["phase"] == "Timeout":
+                result_entry["status"] = "skipped"
+                result_entry["error"] = "Timed out waiting for pod to schedule (no free GPU?)"
+            else:
+                result_entry["error"] = "Diagnostic job failed"
+
+            node_results.append(result_entry)
+            task["completed_nodes"] = len(node_results)
+
+        _set_step(
+            task, "collect", "done",
+            f"Collected results from {len(node_results)} node(s)",
+        )
+
+        # Step 7: Cleanup
         task["status"] = "cleaning_up"
-        task["message"] = "Cleaning up diagnostic jobs..."
+        _set_step(task, "cleanup", "active", f"Deleting {len(job_map)} diagnostic job(s)...")
 
+        deleted = 0
         for job_name in job_map:
             try:
                 await loop.run_in_executor(
@@ -711,26 +806,24 @@ async def _run_gpu_health_check(cluster_id: str, task_id: str):
                         GPU_HEALTH_CHECK_NAMESPACE, jn
                     ),
                 )
+                deleted += 1
             except Exception as e:
                 logger.warning(f"Failed to delete job {job_name}: {e}")
 
+        _set_step(task, "cleanup", "done", f"Deleted {deleted} job(s)")
+
+        # Aggregate summary
         total_gpus = sum(len(n["gpus"]) for n in node_results)
         healthy = sum(
-            1
-            for n in node_results
-            for g in n["gpus"]
+            1 for n in node_results for g in n["gpus"]
             if g.get("health_status") == "healthy"
         )
         warnings = sum(
-            1
-            for n in node_results
-            for g in n["gpus"]
+            1 for n in node_results for g in n["gpus"]
             if g.get("health_status") == "warning"
         )
         errors = sum(
-            1
-            for n in node_results
-            for g in n["gpus"]
+            1 for n in node_results for g in n["gpus"]
             if g.get("health_status") == "error"
         )
         nodes_checked = sum(1 for n in node_results if n["status"] != "skipped")
@@ -758,8 +851,14 @@ async def _run_gpu_health_check(cluster_id: str, task_id: str):
         task["status"] = "failed"
         task["error"] = str(e)
         task["completed_at"] = datetime.now(timezone.utc).isoformat()
+        # Mark the currently active step as errored
+        for step in task.get("steps", []):
+            if step["status"] == "active":
+                step["status"] = "error"
+                step["detail"] = str(e)
+                break
 
-        for job_name in job_map if "job_map" in dir() else []:
+        for job_name in job_map:
             try:
                 k8s.delete_job(GPU_HEALTH_CHECK_NAMESPACE, job_name)
             except Exception:
@@ -800,6 +899,16 @@ async def launch_gpu_health_check(
         "completed_at": None,
         "total_nodes": 0,
         "completed_nodes": 0,
+        "steps": [
+            {"key": "connect", "label": "Connecting to cluster", "status": "active", "detail": None},
+            {"key": "discover", "label": "Discovering GPU nodes", "status": "pending", "detail": None},
+            {"key": "namespace", "label": "Preparing health-check namespace", "status": "pending", "detail": None},
+            {"key": "create_jobs", "label": "Creating diagnostic jobs", "status": "pending", "detail": None},
+            {"key": "wait_pods", "label": "Running diagnostics on nodes", "status": "pending", "detail": None},
+            {"key": "collect", "label": "Collecting results", "status": "pending", "detail": None},
+            {"key": "cleanup", "label": "Cleaning up diagnostic pods", "status": "pending", "detail": None},
+        ],
+        "node_jobs": [],
         "results": None,
         "error": None,
     }

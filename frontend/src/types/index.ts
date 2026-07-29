@@ -383,6 +383,21 @@ export interface GpuHealthCheckResults {
   summary: GpuHealthSummary
 }
 
+export interface HealthCheckStep {
+  key: string
+  label: string
+  status: 'pending' | 'active' | 'done' | 'error'
+  detail?: string
+}
+
+export interface NodeJobStatus {
+  node_name: string
+  job_name: string
+  gpu_count: number
+  gpu_product: string
+  phase: 'Pending' | 'Running' | 'Succeeded' | 'Failed' | 'Timeout'
+}
+
 export interface GpuHealthCheckStatus {
   task_id?: string
   status: 'idle' | 'starting' | 'creating_jobs' | 'waiting' | 'collecting' | 'cleaning_up' | 'completed' | 'failed'
@@ -391,6 +406,8 @@ export interface GpuHealthCheckStatus {
   completed_at?: string
   total_nodes: number
   completed_nodes: number
+  steps?: HealthCheckStep[]
+  node_jobs?: NodeJobStatus[]
   results?: GpuHealthCheckResults
   error?: string
 }

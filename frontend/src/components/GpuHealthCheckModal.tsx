@@ -7,9 +7,10 @@ import {
   ArrowPathIcon,
   CpuChipIcon,
   ServerStackIcon,
+  ClockIcon,
 } from '@heroicons/react/24/outline'
 import { useGpuHealthCheckStatus, useLaunchGpuHealthCheck } from '../hooks/useGpuHealthCheck'
-import type { GpuDeviceHealth, GpuNodeHealthResult } from '../types'
+import type { GpuDeviceHealth, GpuNodeHealthResult, HealthCheckStep, NodeJobStatus } from '../types'
 
 interface GpuHealthCheckModalProps {
   open: boolean
@@ -69,6 +70,103 @@ function GpuCard({ gpu }: { gpu: GpuDeviceHealth }) {
   )
 }
 
+function StepIcon({ status }: { status: string }) {
+  switch (status) {
+    case 'done':
+      return <CheckCircleIcon className="h-5 w-5 text-green-500" />
+    case 'active':
+      return <ArrowPathIcon className="h-5 w-5 text-primary-600 animate-spin" />
+    case 'error':
+      return <XCircleIcon className="h-5 w-5 text-red-500" />
+    default:
+      return <div className="h-5 w-5 rounded-full border-2 border-gray-300" />
+  }
+}
+
+function StepTimeline({ steps }: { steps: HealthCheckStep[] }) {
+  return (
+    <div className="space-y-1">
+      {steps.map((step, i) => (
+        <div key={step.key} className="flex items-start gap-3">
+          <div className="flex flex-col items-center">
+            <StepIcon status={step.status} />
+            {i < steps.length - 1 && (
+              <div className={`w-0.5 h-4 mt-0.5 ${
+                step.status === 'done' ? 'bg-green-300' :
+                step.status === 'active' ? 'bg-primary-300' : 'bg-gray-200'
+              }`} />
+            )}
+          </div>
+          <div className="min-w-0 flex-1 pb-1">
+            <div className={`text-sm font-medium ${
+              step.status === 'done' ? 'text-gray-700' :
+              step.status === 'active' ? 'text-primary-700' :
+              step.status === 'error' ? 'text-red-700' : 'text-gray-400'
+            }`}>
+              {step.label}
+            </div>
+            {step.detail && (
+              <div className={`text-xs mt-0.5 ${
+                step.status === 'error' ? 'text-red-500' : 'text-gray-500'
+              }`}>
+                {step.detail}
+              </div>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function NodeJobPhaseIcon({ phase }: { phase: string }) {
+  switch (phase) {
+    case 'Succeeded':
+      return <CheckCircleIcon className="h-4 w-4 text-green-500" />
+    case 'Running':
+      return <ArrowPathIcon className="h-4 w-4 text-blue-500 animate-spin" />
+    case 'Failed':
+      return <XCircleIcon className="h-4 w-4 text-red-500" />
+    case 'Timeout':
+      return <ExclamationTriangleIcon className="h-4 w-4 text-yellow-500" />
+    default:
+      return <ClockIcon className="h-4 w-4 text-gray-400" />
+  }
+}
+
+function NodeJobList({ nodeJobs }: { nodeJobs: NodeJobStatus[] }) {
+  if (nodeJobs.length === 0) return null
+  return (
+    <div className="mt-3 rounded-lg border border-gray-200 overflow-hidden">
+      <div className="px-3 py-1.5 bg-gray-50 border-b border-gray-200">
+        <span className="text-xs font-medium text-gray-600">Diagnostic Pods</span>
+      </div>
+      <div className="divide-y divide-gray-100">
+        {nodeJobs.map((nj) => (
+          <div key={nj.job_name} className="px-3 py-2 flex items-center justify-between text-sm">
+            <div className="flex items-center gap-2 min-w-0">
+              <ServerStackIcon className="h-4 w-4 text-gray-400 flex-shrink-0" />
+              <span className="truncate text-gray-700">{nj.node_name}</span>
+              <span className="text-xs text-gray-400">{nj.gpu_count} GPU(s)</span>
+            </div>
+            <div className="flex items-center gap-1.5 flex-shrink-0">
+              <NodeJobPhaseIcon phase={nj.phase} />
+              <span className={`text-xs font-medium ${
+                nj.phase === 'Succeeded' ? 'text-green-600' :
+                nj.phase === 'Running' ? 'text-blue-600' :
+                nj.phase === 'Failed' ? 'text-red-600' :
+                nj.phase === 'Timeout' ? 'text-yellow-600' : 'text-gray-500'
+              }`}>
+                {nj.phase}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function NodeResult({ node }: { node: GpuNodeHealthResult }) {
   return (
     <div className="border border-gray-200 rounded-lg overflow-hidden">
@@ -123,10 +221,6 @@ export default function GpuHealthCheckModal({ open, onClose, clusterId, clusterN
       onClose()
     }
   }
-
-  const progress = checkStatus?.total_nodes
-    ? Math.round((checkStatus.completed_nodes / checkStatus.total_nodes) * 100)
-    : 0
 
   const summary = checkStatus?.results?.summary
 
@@ -192,24 +286,17 @@ export default function GpuHealthCheckModal({ open, onClose, clusterId, clusterN
                   {/* In-progress state */}
                   {(isActive || launchCheck.isPending) && (
                     <div className="space-y-4">
-                      <div className="flex items-center gap-3">
-                        <ArrowPathIcon className="h-5 w-5 text-primary-600 animate-spin" />
-                        <span className="text-sm text-gray-700">
-                          {checkStatus?.message || 'Starting health check...'}
-                        </span>
-                      </div>
-                      {(checkStatus?.total_nodes ?? 0) > 0 && checkStatus && (
-                        <div>
-                          <div className="flex justify-between text-xs text-gray-500 mb-1">
-                            <span>{checkStatus.completed_nodes} of {checkStatus.total_nodes} nodes</span>
-                            <span>{progress}%</span>
-                          </div>
-                          <div className="w-full bg-gray-200 rounded-full h-2">
-                            <div
-                              className="bg-primary-600 h-2 rounded-full transition-all duration-500"
-                              style={{ width: `${progress}%` }}
-                            />
-                          </div>
+                      {checkStatus?.steps && checkStatus.steps.length > 0 ? (
+                        <>
+                          <StepTimeline steps={checkStatus.steps} />
+                          {checkStatus.node_jobs && checkStatus.node_jobs.length > 0 && (
+                            <NodeJobList nodeJobs={checkStatus.node_jobs} />
+                          )}
+                        </>
+                      ) : (
+                        <div className="flex items-center gap-3">
+                          <ArrowPathIcon className="h-5 w-5 text-primary-600 animate-spin" />
+                          <span className="text-sm text-gray-700">Starting health check...</span>
                         </div>
                       )}
                     </div>
