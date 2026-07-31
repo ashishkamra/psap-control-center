@@ -148,7 +148,7 @@ export PRE_BURN_TEMPS=$(nvidia-smi --query-gpu=index,temperature.gpu --format=cs
 
 # Run burn test using cuBLAS HGEMM (FP16) for maximum power draw
 # 60s burn, 16384x16384 matrices, back-to-back GEMM without sync to saturate pipeline
-python3 << 'BURNEOF' > /tmp/burn_output.txt 2>&1 &
+cat > /tmp/burn_test.py << 'BURNEOF'
 import ctypes, os, time, threading, sys
 
 BURN_SECONDS = 60
@@ -276,6 +276,7 @@ for g in range(num_gpus):
 for t in threads:
     t.join(timeout=BURN_SECONDS + 30)
 BURNEOF
+python3 /tmp/burn_test.py > /tmp/burn_output.txt 2>&1 &
 BURN_PID=$!
 
 # Monitor temps and power during burn every 5 seconds, show per-GPU
@@ -327,7 +328,7 @@ echo "XID errors:"
 if [ -n "$XID" ]; then echo "$XID"; else echo "None"; fi
 echo "END_RAW_DATA"
 
-python3 << 'PYEOF'
+cat > /tmp/analyze.py << 'PYEOF'
 import os, sys
 
 gpu_details = os.environ.get("GPU_DETAILS", "")
@@ -717,6 +718,7 @@ print(f"  Summary: {len(errors)} error(s), {len(warns)} warning(s), {len(passes)
 print(bar)
 print("END_REPORT")
 PYEOF
+python3 /tmp/analyze.py
 DIAGEOF
 )
 
