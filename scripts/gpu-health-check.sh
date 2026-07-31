@@ -3,7 +3,7 @@ set -euo pipefail
 
 NAMESPACE="gpu-health-check"
 IMAGE="nvcr.io/nvidia/cuda:12.6.3-runtime-ubi9"
-TIMEOUT=300
+TIMEOUT=360
 POLL_INTERVAL=3
 KEEP_JOBS=false
 VERBOSE=false
@@ -35,7 +35,7 @@ Checks performed per GPU:
   - NVLink status
   - XID errors in kernel log
   - Temperature stability over 10-second sampling window
-  - 30-second GPU burn test (cuBLAS SGEMM matrix multiply)
+  - 60-second GPU burn test (cuBLAS FP16 tensor core GEMM, 16384x16384 matrices)
     - Thermal response under sustained load
     - Throttle detection under sustained load
     - Compute throughput (GFLOPS)
@@ -142,16 +142,17 @@ export DMON=$(nvidia-smi dmon -s pucvmet -d 1 -c 10 2>&1 || echo "")
 
 # GPU burn stress test
 NUM_GPUS=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
-echo "Running GPU burn test (30s) on ${NUM_GPUS} GPU(s)..."
+echo "Running GPU burn test (60s) on ${NUM_GPUS} GPU(s)..."
 
 export PRE_BURN_TEMPS=$(nvidia-smi --query-gpu=index,temperature.gpu --format=csv,noheader,nounits 2>&1)
 
 # Run burn test using cuBLAS HGEMM (FP16) for maximum power draw
+# 60s burn, 16384x16384 matrices, back-to-back GEMM without sync to saturate pipeline
 python3 << 'BURNEOF' > /tmp/burn_output.txt 2>&1 &
 import ctypes, os, time, threading, sys
 
-BURN_SECONDS = 30
-MATRIX_DIM = 8192
+BURN_SECONDS = 60
+MATRIX_DIM = 16384
 
 CUBLAS_OP_N = 0
 CUDA_R_16F = 2
@@ -216,8 +217,10 @@ def burn_gpu(gpu_id):
                 ctypes.byref(alpha), d_A, n, d_B, n,
                 ctypes.byref(beta), d_C, n
             )
-            cudart.cudaDeviceSynchronize()
             ops += 1
+            if ops % 50 == 0:
+                cudart.cudaDeviceSynchronize()
+        cudart.cudaDeviceSynchronize()
         tflops = (2.0 * n * n * n * ops) / (BURN_SECONDS * 1e12)
         print(f"BURN_RESULT:GPU{gpu_id}:PASS:{ops} iters, {tflops:.1f} TFLOPS (FP32 fallback)")
     else:
@@ -234,8 +237,10 @@ def burn_gpu(gpu_id):
                 CUDA_R_32F,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP
             )
-            cudart.cudaDeviceSynchronize()
             ops += 1
+            if ops % 50 == 0:
+                cudart.cudaDeviceSynchronize()
+        cudart.cudaDeviceSynchronize()
         tflops = (2.0 * n * n * n * ops) / (BURN_SECONDS * 1e12)
         print(f"BURN_RESULT:GPU{gpu_id}:PASS:{ops} iters, {tflops:.1f} TFLOPS (FP16 tensor cores)")
 
@@ -252,20 +257,20 @@ for g in range(num_gpus):
     threads.append(t)
 
 for t in threads:
-    t.join(timeout=BURN_SECONDS + 10)
+    t.join(timeout=BURN_SECONDS + 30)
 BURNEOF
 BURN_PID=$!
 
-# Monitor temps and power during burn every 5 seconds
+# Monitor temps and power during burn every 5 seconds, show per-GPU
 BURN_MONITOR=""
-for tick in 1 2 3 4 5 6; do
+for tick in $(seq 1 12); do
   sleep 5
   SNAP=$(nvidia-smi --query-gpu=index,temperature.gpu,power.draw,power.limit,clocks.current.graphics,clocks_event_reasons.hw_thermal_slowdown,clocks_event_reasons.sw_power_cap,clocks_event_reasons.hw_slowdown --format=csv,noheader,nounits 2>&1 || echo "")
   BURN_MONITOR="${BURN_MONITOR}
 TICK${tick}:${SNAP}"
   ELAPSED=$((tick * 5))
-  STATS=$(echo "$SNAP" | awk -F', ' '{printf "GPU%s: %sC %sW/%sW  ", $1, $2, $3, $4}')
-  echo "  Burn [${ELAPSED}s/30s]: ${STATS}"
+  echo "  Burn [${ELAPSED}s/60s]:"
+  echo "$SNAP" | awk -F', ' '{printf "    GPU %s: %sC  %sW / %sW  clk %s MHz\n", $1, $2, $3, $4, $5}'
   if ! kill -0 $BURN_PID 2>/dev/null; then
     break
   fi
@@ -584,7 +589,7 @@ for line in burn_monitor.strip().splitlines():
 for idx in sorted(gpu_info):
     peak = max_burn_temps.get(idx)
     if peak is not None and peak >= 85:
-        findings.append(("WARN", idx, "Burn Peak Temp", f"Peaked at {peak:.0f}C during 30s burn — approaching thermal limit."))
+        findings.append(("WARN", idx, "Burn Peak Temp", f"Peaked at {peak:.0f}C during 60s burn — approaching thermal limit."))
 
 for idx in sorted(gpu_info):
     peak_pwr = max_burn_power.get(idx)
@@ -700,7 +705,7 @@ metadata:
     app: gpu-health-check
 spec:
   ttlSecondsAfterFinished: 300
-  activeDeadlineSeconds: 240
+  activeDeadlineSeconds: 300
   backoffLimit: 0
   template:
     spec:
