@@ -167,87 +167,104 @@ except OSError:
     sys.exit(0)
 
 def burn_gpu(gpu_id):
-    cudart.cudaSetDevice(gpu_id)
-    handle = ctypes.c_void_p()
-    cublas.cublasCreate_v2(ctypes.byref(handle))
-    cublas.cublasSetMathMode(handle, 1)
+    try:
+        rc = cudart.cudaSetDevice(gpu_id)
+        if rc != 0:
+            print(f"BURN_RESULT:GPU{gpu_id}:ERROR:cudaSetDevice failed (rc={rc})")
+            return
 
-    n = MATRIX_DIM
-    size_fp16 = n * n * 2
-    size_fp32 = n * n * 4
+        handle = ctypes.c_void_p()
+        rc = cublas.cublasCreate_v2(ctypes.byref(handle))
+        if rc != 0:
+            print(f"BURN_RESULT:GPU{gpu_id}:ERROR:cublasCreate failed (rc={rc})")
+            return
+        cublas.cublasSetMathMode(handle, 1)
 
-    d_A = ctypes.c_void_p()
-    d_B = ctypes.c_void_p()
-    d_C = ctypes.c_void_p()
-    cudart.cudaMalloc(ctypes.byref(d_A), size_fp16)
-    cudart.cudaMalloc(ctypes.byref(d_B), size_fp16)
-    cudart.cudaMalloc(ctypes.byref(d_C), size_fp32)
-    cudart.cudaMemset(d_A, 0, size_fp16)
-    cudart.cudaMemset(d_B, 0, size_fp16)
-    cudart.cudaMemset(d_C, 0, size_fp32)
+        n = MATRIX_DIM
+        size_fp16 = n * n * 2
+        size_fp32 = n * n * 4
 
-    alpha = ctypes.c_float(1.0)
-    beta = ctypes.c_float(0.0)
+        d_A = ctypes.c_void_p()
+        d_B = ctypes.c_void_p()
+        d_C = ctypes.c_void_p()
+        rc_a = cudart.cudaMalloc(ctypes.byref(d_A), size_fp16)
+        rc_b = cudart.cudaMalloc(ctypes.byref(d_B), size_fp16)
+        rc_c = cudart.cudaMalloc(ctypes.byref(d_C), size_fp32)
+        if rc_a != 0 or rc_b != 0 or rc_c != 0:
+            print(f"BURN_RESULT:GPU{gpu_id}:ERROR:cudaMalloc failed (A={rc_a} B={rc_b} C={rc_c})")
+            cublas.cublasDestroy_v2(handle)
+            return
+        cudart.cudaMemset(d_A, 0, size_fp16)
+        cudart.cudaMemset(d_B, 0, size_fp16)
+        cudart.cudaMemset(d_C, 0, size_fp32)
 
-    end_time = time.time() + BURN_SECONDS
-    ops = 0
-    err = cublas.cublasGemmEx(
-        handle, CUBLAS_OP_N, CUBLAS_OP_N,
-        n, n, n,
-        ctypes.byref(alpha),
-        d_A, CUDA_R_16F, n,
-        d_B, CUDA_R_16F, n,
-        ctypes.byref(beta),
-        d_C, CUDA_R_32F, n,
-        CUDA_R_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    )
-    cudart.cudaDeviceSynchronize()
-    if err != 0:
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+
+        print(f"BURN_STATUS:GPU{gpu_id}:started", flush=True)
+
+        end_time = time.time() + BURN_SECONDS
+        ops = 0
+        err = cublas.cublasGemmEx(
+            handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            n, n, n,
+            ctypes.byref(alpha),
+            d_A, CUDA_R_16F, n,
+            d_B, CUDA_R_16F, n,
+            ctypes.byref(beta),
+            d_C, CUDA_R_32F, n,
+            CUDA_R_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        )
+        cudart.cudaDeviceSynchronize()
+        if err != 0:
+            print(f"BURN_STATUS:GPU{gpu_id}:GemmEx failed (rc={err}), falling back to FP32 SGEMM", flush=True)
+            cudart.cudaFree(d_A)
+            cudart.cudaFree(d_B)
+            cudart.cudaFree(d_C)
+            size_f32 = n * n * 4
+            cudart.cudaMalloc(ctypes.byref(d_A), size_f32)
+            cudart.cudaMalloc(ctypes.byref(d_B), size_f32)
+            cudart.cudaMalloc(ctypes.byref(d_C), size_f32)
+            while time.time() < end_time:
+                cublas.cublasSgemm_v2(
+                    handle, 0, 0, n, n, n,
+                    ctypes.byref(alpha), d_A, n, d_B, n,
+                    ctypes.byref(beta), d_C, n
+                )
+                ops += 1
+                if ops % 50 == 0:
+                    cudart.cudaDeviceSynchronize()
+            cudart.cudaDeviceSynchronize()
+            tflops = (2.0 * n * n * n * ops) / (BURN_SECONDS * 1e12)
+            print(f"BURN_RESULT:GPU{gpu_id}:PASS:{ops} iters, {tflops:.1f} TFLOPS (FP32 fallback)")
+        else:
+            ops = 1
+            while time.time() < end_time:
+                cublas.cublasGemmEx(
+                    handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    n, n, n,
+                    ctypes.byref(alpha),
+                    d_A, CUDA_R_16F, n,
+                    d_B, CUDA_R_16F, n,
+                    ctypes.byref(beta),
+                    d_C, CUDA_R_32F, n,
+                    CUDA_R_32F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP
+                )
+                ops += 1
+                if ops % 50 == 0:
+                    cudart.cudaDeviceSynchronize()
+            cudart.cudaDeviceSynchronize()
+            tflops = (2.0 * n * n * n * ops) / (BURN_SECONDS * 1e12)
+            print(f"BURN_RESULT:GPU{gpu_id}:PASS:{ops} iters, {tflops:.1f} TFLOPS (FP16 tensor cores)")
+
         cudart.cudaFree(d_A)
         cudart.cudaFree(d_B)
         cudart.cudaFree(d_C)
-        size_f32 = n * n * 4
-        cudart.cudaMalloc(ctypes.byref(d_A), size_f32)
-        cudart.cudaMalloc(ctypes.byref(d_B), size_f32)
-        cudart.cudaMalloc(ctypes.byref(d_C), size_f32)
-        while time.time() < end_time:
-            cublas.cublasSgemm_v2(
-                handle, 0, 0, n, n, n,
-                ctypes.byref(alpha), d_A, n, d_B, n,
-                ctypes.byref(beta), d_C, n
-            )
-            ops += 1
-            if ops % 50 == 0:
-                cudart.cudaDeviceSynchronize()
-        cudart.cudaDeviceSynchronize()
-        tflops = (2.0 * n * n * n * ops) / (BURN_SECONDS * 1e12)
-        print(f"BURN_RESULT:GPU{gpu_id}:PASS:{ops} iters, {tflops:.1f} TFLOPS (FP32 fallback)")
-    else:
-        ops = 1
-        while time.time() < end_time:
-            cublas.cublasGemmEx(
-                handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                n, n, n,
-                ctypes.byref(alpha),
-                d_A, CUDA_R_16F, n,
-                d_B, CUDA_R_16F, n,
-                ctypes.byref(beta),
-                d_C, CUDA_R_32F, n,
-                CUDA_R_32F,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP
-            )
-            ops += 1
-            if ops % 50 == 0:
-                cudart.cudaDeviceSynchronize()
-        cudart.cudaDeviceSynchronize()
-        tflops = (2.0 * n * n * n * ops) / (BURN_SECONDS * 1e12)
-        print(f"BURN_RESULT:GPU{gpu_id}:PASS:{ops} iters, {tflops:.1f} TFLOPS (FP16 tensor cores)")
-
-    cudart.cudaFree(d_A)
-    cudart.cudaFree(d_B)
-    cudart.cudaFree(d_C)
-    cublas.cublasDestroy_v2(handle)
+        cublas.cublasDestroy_v2(handle)
+    except Exception as e:
+        print(f"BURN_RESULT:GPU{gpu_id}:ERROR:{e}")
 
 num_gpus = int(os.popen("nvidia-smi --query-gpu=index --format=csv,noheader | wc -l").read().strip())
 threads = []
@@ -603,6 +620,7 @@ for idx in sorted(gpu_info):
         else:
             findings.append(("WARN", idx, "Burn Power Draw", f"Only reached {peak_pwr:.0f}W of {pwr_limit:.0f}W limit ({pct:.0f}%) — GPU not reaching expected power. Check power supply or driver config."))
 
+burn_gpus_reported = set()
 for line in burn_output.strip().splitlines():
     if line.startswith("BURN_RESULT:"):
         parts = line.split(":", 3)
@@ -611,12 +629,21 @@ for line in burn_output.strip().splitlines():
             status = parts[2]
             detail = parts[3]
             idx = gpu_label.replace("GPU", "")
+            burn_gpus_reported.add(idx)
             if status == "PASS":
                 findings.append(("PASS", idx, "Burn Test Compute", detail))
             else:
                 findings.append(("ERROR", idx, "Burn Test Compute", detail))
     elif line.startswith("BURN_RESULT:ERROR:"):
         findings.append(("ERROR", "all", "Burn Test Compute", line.split(":", 2)[2]))
+
+for idx in sorted(gpu_info):
+    if idx not in burn_gpus_reported:
+        status_lines = [l for l in burn_output.strip().splitlines() if f"GPU{idx}" in l]
+        if status_lines:
+            findings.append(("ERROR", idx, "Burn Test Compute", f"No result — last status: {status_lines[-1]}"))
+        else:
+            findings.append(("ERROR", idx, "Burn Test Compute", "No result — burn thread may have crashed silently"))
 
 # === Analyze dmon thermal trends ===
 temps = []
